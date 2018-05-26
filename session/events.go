@@ -57,9 +57,22 @@ func NewEventPool(debug bool, silent bool) *EventPool {
 func (p *EventPool) Listen() <-chan Event {
 	p.Lock()
 	defer p.Unlock()
-	l := make(chan Event, 1)
+	l := make(chan Event)
 	p.listeners = append(p.listeners, l)
 	return l
+}
+
+func (p *EventPool) Unlisten(listener <-chan Event) {
+	p.Lock()
+	defer p.Unlock()
+
+	for i, l := range p.listeners {
+		if l == listener {
+			close(l)
+			p.listeners = append(p.listeners[:i], p.listeners[i+1:]...)
+			return
+		}
+	}
 }
 
 func (p *EventPool) SetSilent(s bool) {
@@ -83,17 +96,14 @@ func (p *EventPool) Add(tag string, data interface{}) {
 
 	// broadcast the event to every listener
 	for _, l := range p.listeners {
-		select {
-		case l <- e:
-		default:
-		}
+		l <- e
 	}
 }
 
 func (p *EventPool) Log(level int, format string, args ...interface{}) {
-	if level == core.DEBUG && p.debug == false {
+	if level == core.DEBUG && !p.debug {
 		return
-	} else if level < core.ERROR && p.silent == true {
+	} else if level < core.ERROR && p.silent {
 		return
 	}
 

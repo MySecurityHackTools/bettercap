@@ -2,6 +2,7 @@ package modules
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 
@@ -12,6 +13,7 @@ import (
 
 type EventsStream struct {
 	session.SessionModule
+	output        *os.File
 	ignoreList    *IgnoreList
 	waitFor       string
 	waitChan      chan *session.Event
@@ -22,6 +24,7 @@ type EventsStream struct {
 func NewEventsStream(s *session.Session) *EventsStream {
 	stream := &EventsStream{
 		SessionModule: session.NewSessionModule("events.stream", s),
+		output:        os.Stdout,
 		quit:          make(chan bool),
 		waitChan:      make(chan *session.Event),
 		waitFor:       "",
@@ -104,6 +107,11 @@ func NewEventsStream(s *session.Session) *EventsStream {
 			return nil
 		}))
 
+	stream.AddParam(session.NewStringParameter("events.stream.output",
+		"",
+		"",
+		"If not empty, events will be written to this file instead of the standard output."))
+
 	return stream
 }
 
@@ -119,13 +127,29 @@ func (s EventsStream) Author() string {
 	return "Simone Margaritelli <evilsocket@protonmail.com>"
 }
 
-func (s *EventsStream) Configure() error {
-	return nil
+func (s *EventsStream) Configure() (err error) {
+	var output string
+
+	if err, output = s.StringParam("events.stream.output"); err == nil {
+		if output == "" {
+			s.output = os.Stdout
+		} else if output, err = core.ExpandPath(output); err == nil {
+			s.output, err = os.OpenFile(output, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		}
+	}
+
+	return err
 }
 
 func (s *EventsStream) Start() error {
+	if err := s.Configure(); err != nil {
+		return err
+	}
+
 	return s.SetRunning(true, func() {
 		s.eventListener = s.Session.Events.Listen()
+		defer s.Session.Events.Unlisten(s.eventListener)
+
 		for {
 			var e session.Event
 			select {
@@ -135,12 +159,11 @@ func (s *EventsStream) Start() error {
 					s.waitChan <- &e
 				}
 
-				if s.ignoreList.Ignored(e) == false {
+				if !s.ignoreList.Ignored(e) {
 					s.View(e, true)
 				} else {
 					log.Debug("Skipping ignored event %v", e)
 				}
-				break
 
 			case <-s.quit:
 				return
@@ -158,13 +181,16 @@ func (s *EventsStream) Show(limit int) error {
 		from = num - limit
 	}
 
-	fmt.Println()
+	selected := events[from:num]
+	if len(selected) > 0 {
+		fmt.Println()
 
-	for _, e := range events[from:num] {
-		s.View(e, false)
+		for _, e := range selected {
+			s.View(e, false)
+		}
+
+		s.Session.Refresh()
 	}
-
-	s.Session.Refresh()
 
 	return nil
 }
@@ -196,5 +222,8 @@ func (s *EventsStream) startWaitingFor(tag string, timeout int) error {
 func (s *EventsStream) Stop() error {
 	return s.SetRunning(false, func() {
 		s.quit <- true
+		if s.output != os.Stdout {
+			s.output.Close()
+		}
 	})
 }

@@ -11,20 +11,20 @@ import (
 	"github.com/bettercap/bettercap/session"
 	"github.com/bettercap/bettercap/tls"
 
+	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 )
 
 type RestAPI struct {
 	session.SessionModule
-	server        *http.Server
-	username      string
-	password      string
-	certFile      string
-	keyFile       string
-	useWebsocket  bool
-	upgrader      websocket.Upgrader
-	eventListener <-chan session.Event
-	quit          chan bool
+	server       *http.Server
+	username     string
+	password     string
+	certFile     string
+	keyFile      string
+	useWebsocket bool
+	upgrader     websocket.Upgrader
+	quit         chan bool
 }
 
 func NewRestAPI(s *session.Session) *RestAPI {
@@ -33,7 +33,6 @@ func NewRestAPI(s *session.Session) *RestAPI {
 		server:        &http.Server{},
 		quit:          make(chan bool),
 		useWebsocket:  false,
-		eventListener: s.Events.Listen(),
 		upgrader: websocket.Upgrader{
 			ReadBufferSize:  1024,
 			WriteBufferSize: 1024,
@@ -133,7 +132,7 @@ func (api *RestAPI) Configure() error {
 		return err
 	} else if err, api.useWebsocket = api.BoolParam("api.rest.websocket"); err != nil {
 		return err
-	} else if core.Exists(api.certFile) == false || core.Exists(api.keyFile) == false {
+	} else if !core.Exists(api.certFile) || !core.Exists(api.keyFile) {
 		log.Info("Generating TLS key to %s", api.keyFile)
 		log.Info("Generating TLS certificate to %s", api.certFile)
 		if err := tls.Generate(api.certFile, api.keyFile); err != nil {
@@ -146,10 +145,22 @@ func (api *RestAPI) Configure() error {
 
 	api.server.Addr = fmt.Sprintf("%s:%d", ip, port)
 
-	router := http.NewServeMux()
+	router := mux.NewRouter()
 
-	router.HandleFunc("/api/session", api.sessionRoute)
 	router.HandleFunc("/api/events", api.eventsRoute)
+	router.HandleFunc("/api/session", api.sessionRoute)
+	router.HandleFunc("/api/session/ble", api.sessionRoute)
+	router.HandleFunc("/api/session/ble/{mac}", api.sessionRoute)
+	router.HandleFunc("/api/session/env", api.sessionRoute)
+	router.HandleFunc("/api/session/gateway", api.sessionRoute)
+	router.HandleFunc("/api/session/interface", api.sessionRoute)
+	router.HandleFunc("/api/session/lan", api.sessionRoute)
+	router.HandleFunc("/api/session/lan/{mac}", api.sessionRoute)
+	router.HandleFunc("/api/session/options", api.sessionRoute)
+	router.HandleFunc("/api/session/packets", api.sessionRoute)
+	router.HandleFunc("/api/session/started-at", api.sessionRoute)
+	router.HandleFunc("/api/session/wifi", api.sessionRoute)
+	router.HandleFunc("/api/session/wifi/{mac}", api.sessionRoute)
 
 	api.server.Handler = router
 
