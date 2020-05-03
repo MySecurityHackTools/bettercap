@@ -2,13 +2,14 @@ package session
 
 import (
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"net"
 	"regexp"
 	"strconv"
 	"strings"
 
-	"github.com/bettercap/bettercap/core"
+	"github.com/evilsocket/islazy/tui"
 )
 
 type ParamType int
@@ -17,6 +18,7 @@ const (
 	STRING ParamType = iota
 	BOOL             = iota
 	INT              = iota
+	FLOAT            = iota
 )
 
 type ModuleParam struct {
@@ -53,19 +55,24 @@ func NewBoolParameter(name string, def_value string, desc string) *ModuleParam {
 }
 
 func NewIntParameter(name string, def_value string, desc string) *ModuleParam {
-	return NewModuleParameter(name, def_value, INT, "^[\\d]+$", desc)
+	return NewModuleParameter(name, def_value, INT, `^[\-\+]?[\d]+$`, desc)
 }
 
-func (p ModuleParam) Validate(value string) (error, interface{}) {
+func NewDecimalParameter(name string, def_value string, desc string) *ModuleParam {
+	return NewModuleParameter(name, def_value, FLOAT, "^[\\d]+(\\.\\d+)?$", desc)
+}
+
+func (p ModuleParam) validate(value string) (error, interface{}) {
 	if p.Validator != nil {
 		if !p.Validator.MatchString(value) {
-			return fmt.Errorf("Parameter %s not valid: '%s' does not match rule '%s'.", core.Bold(p.Name), value, p.Validator.String()), nil
+			return fmt.Errorf("Parameter %s not valid: '%s' does not match rule '%s'.", tui.Bold(p.Name), value, p.Validator.String()), nil
 		}
 	}
 
-	if p.Type == STRING {
+	switch p.Type {
+	case STRING:
 		return nil, value
-	} else if p.Type == BOOL {
+	case BOOL:
 		lvalue := strings.ToLower(value)
 		if lvalue == "true" {
 			return nil, true
@@ -74,8 +81,11 @@ func (p ModuleParam) Validate(value string) (error, interface{}) {
 		} else {
 			return fmt.Errorf("Can't typecast '%s' to boolean.", value), nil
 		}
-	} else if p.Type == INT {
+	case INT:
 		i, err := strconv.Atoi(value)
+		return err, i
+	case FLOAT:
+		i, err := strconv.ParseFloat(value, 64)
 		return err, i
 	}
 
@@ -84,36 +94,73 @@ func (p ModuleParam) Validate(value string) (error, interface{}) {
 
 const ParamIfaceName = "<interface name>"
 const ParamIfaceAddress = "<interface address>"
+const ParamIfaceAddress6 = "<interface address6>"
 const ParamSubnet = "<entire subnet>"
 const ParamRandomMAC = "<random mac>"
 
-func (p ModuleParam) Get(s *Session) (error, interface{}) {
-	_, v := s.Env.Get(p.Name)
-	if v == ParamIfaceName {
+func (p ModuleParam) parse(s *Session, v string) string {
+	switch v {
+	case ParamIfaceName:
 		v = s.Interface.Name()
-	} else if v == ParamIfaceAddress {
+	case ParamIfaceAddress:
 		v = s.Interface.IpAddress
-	} else if v == ParamSubnet {
+	case ParamIfaceAddress6:
+		v = s.Interface.Ip6Address
+	case ParamSubnet:
 		v = s.Interface.CIDR()
-	} else if v == ParamRandomMAC {
+	case ParamRandomMAC:
 		hw := make([]byte, 6)
 		rand.Read(hw)
 		v = net.HardwareAddr(hw).String()
 	}
-	return p.Validate(v)
+	return v
+
 }
 
-func (p ModuleParam) Dump(padding int) string {
-	return fmt.Sprintf("  "+core.YELLOW+"%"+strconv.Itoa(padding)+"s"+core.RESET+
-		" : %s\n", p.Name, p.Value)
+func (p ModuleParam) getUnlocked(s *Session) string {
+	_, v := s.Env.GetUnlocked(p.Name)
+	return p.parse(s, v)
+}
+
+func (p ModuleParam) Get(s *Session) (error, interface{}) {
+	_, v := s.Env.Get(p.Name)
+	v = p.parse(s, v)
+	return p.validate(v)
 }
 
 func (p ModuleParam) Help(padding int) string {
-	return fmt.Sprintf("  "+core.YELLOW+"%"+strconv.Itoa(padding)+"s"+core.RESET+
+	return fmt.Sprintf("  "+tui.YELLOW+"%"+strconv.Itoa(padding)+"s"+tui.RESET+
 		" : "+
-		"%s "+core.DIM+"(default=%s"+core.RESET+")\n", p.Name, p.Description, p.Value)
+		"%s "+tui.DIM+"(default=%s"+tui.RESET+")\n", p.Name, p.Description, p.Value)
 }
 
 func (p ModuleParam) Register(s *Session) {
 	s.Env.Set(p.Name, p.Value)
+}
+
+func (p ModuleParam) RegisterObserver(s *Session, cb EnvironmentChangedCallback) {
+	s.Env.WithCallback(p.Name, p.Value, cb)
+}
+
+type JSONModuleParam struct {
+	Name        string    `json:"name"`
+	Type        ParamType `json:"type"`
+	Description string    `json:"description"`
+	Value       string    `json:"default_value"`
+	Current     string    `json:"current_value"`
+	Validator   string    `json:"validator"`
+}
+
+func (p ModuleParam) MarshalJSON() ([]byte, error) {
+	j := JSONModuleParam{
+		Name:        p.Name,
+		Type:        p.Type,
+		Description: p.Description,
+		Value:       p.Value,
+		Current:     p.getUnlocked(I), // if we're here, Env is already locked
+	}
+	if p.Validator != nil {
+		j.Validator = p.Validator.String()
+	}
+	return json.Marshal(j)
 }

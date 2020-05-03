@@ -9,6 +9,10 @@ import (
 
 	"github.com/bettercap/bettercap/core"
 
+	"github.com/evilsocket/islazy/data"
+	"github.com/evilsocket/islazy/str"
+	"github.com/evilsocket/islazy/tui"
+
 	"github.com/malfunkt/iprange"
 )
 
@@ -67,11 +71,31 @@ func NormalizeMac(mac string) string {
 	return strings.ToLower(strings.Join(parts, ":"))
 }
 
-func ParseTargets(targets string, aliasMap *Aliases) (ips []net.IP, macs []net.HardwareAddr, err error) {
+func ParseMACs(targets string) (macs []net.HardwareAddr, err error) {
+	macs = make([]net.HardwareAddr, 0)
+	if targets = str.Trim(targets); targets == "" {
+		return
+	}
+
+	for _, mac := range macParser.FindAllString(targets, -1) {
+		mac = NormalizeMac(mac)
+		hw, err := net.ParseMAC(mac)
+		if err != nil {
+			return nil, fmt.Errorf("error while parsing MAC '%s': %s", mac, err)
+		}
+
+		macs = append(macs, hw)
+		targets = strings.Replace(targets, mac, "", -1)
+	}
+
+	return
+}
+
+func ParseTargets(targets string, aliasMap *data.UnsortedKV) (ips []net.IP, macs []net.HardwareAddr, err error) {
 	ips = make([]net.IP, 0)
 	macs = make([]net.HardwareAddr, 0)
 
-	if targets = core.Trim(targets); targets == "" {
+	if targets = str.Trim(targets); targets == "" {
 		return
 	}
 
@@ -80,7 +104,7 @@ func ParseTargets(targets string, aliasMap *Aliases) (ips []net.IP, macs []net.H
 		mac = NormalizeMac(mac)
 		hw, err := net.ParseMAC(mac)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Error while parsing MAC '%s': %s", mac, err)
+			return nil, nil, fmt.Errorf("error while parsing MAC '%s': %s", mac, err)
 		}
 
 		macs = append(macs, hw)
@@ -89,18 +113,22 @@ func ParseTargets(targets string, aliasMap *Aliases) (ips []net.IP, macs []net.H
 	targets = strings.Trim(targets, ", ")
 
 	// check and resolve aliases
-	for _, alias := range aliasParser.FindAllString(targets, -1) {
-		if mac, found := aliasMap.Find(alias); found {
-			mac = NormalizeMac(mac)
-			hw, err := net.ParseMAC(mac)
-			if err != nil {
-				return nil, nil, fmt.Errorf("Error while parsing MAC '%s': %s", mac, err)
+	for _, targetAlias := range aliasParser.FindAllString(targets, -1) {
+		found := false
+		aliasMap.Each(func(mac, alias string) bool {
+			if alias == targetAlias {
+				if hw, err := net.ParseMAC(mac); err == nil {
+					macs = append(macs, hw)
+					targets = strings.Replace(targets, targetAlias, "", -1)
+					found = true
+					return true
+				}
 			}
+			return false
+		})
 
-			macs = append(macs, hw)
-			targets = strings.Replace(targets, alias, "", -1)
-		} else {
-			return nil, nil, fmt.Errorf("Could not resolve alias %s", alias)
+		if !found {
+			return nil, nil, fmt.Errorf("could not resolve alias %s", targetAlias)
 		}
 	}
 	targets = strings.Trim(targets, ", ")
@@ -109,13 +137,39 @@ func ParseTargets(targets string, aliasMap *Aliases) (ips []net.IP, macs []net.H
 	if targets != "" {
 		list, err := iprange.ParseList(targets)
 		if err != nil {
-			return nil, nil, fmt.Errorf("Error while parsing address list '%s': %s.", targets, err)
+			return nil, nil, fmt.Errorf("error while parsing address list '%s': %s.", targets, err)
 		}
 
 		ips = list.Expand()
 	}
 
 	return
+}
+
+func ParseEndpoints(targets string, lan *LAN) ([]*Endpoint, error) {
+	ips, macs, err := ParseTargets(targets, lan.Aliases())
+	if err != nil {
+		return nil, err
+	}
+
+	tmp := make(map[string]*Endpoint)
+	for _, ip := range ips {
+		if e := lan.GetByIp(ip.String()); e != nil {
+			tmp[e.HW.String()] = e
+		}
+	}
+
+	for _, mac := range macs {
+		if e, found := lan.Get(mac.String()); found {
+			tmp[e.HW.String()] = e
+		}
+	}
+
+	ret := make([]*Endpoint, 0)
+	for _, e := range tmp {
+		ret = append(ret, e)
+	}
+	return ret, nil
 }
 
 func buildEndpointFromInterface(iface net.Interface) (*Endpoint, error) {
@@ -176,7 +230,7 @@ func findInterfaceByName(name string, ifaces []net.Interface) (*Endpoint, error)
 		}
 	}
 
-	return nil, fmt.Errorf("No interface matching '%s' found.", name)
+	return nil, fmt.Errorf("no interface matching '%s' found.", name)
 }
 
 func FindInterface(name string) (*Endpoint, error) {
@@ -184,7 +238,7 @@ func FindInterface(name string) (*Endpoint, error) {
 	if err != nil {
 		return nil, err
 	}
-	name = core.Trim(name)
+	name = str.Trim(name)
 	if name != "" {
 		return findInterfaceByName(name, ifaces)
 	}
@@ -195,7 +249,7 @@ func FindInterface(name string) (*Endpoint, error) {
 	for _, iface := range ifaces {
 		addrs, err := iface.Addrs()
 		if err != nil {
-			fmt.Printf("WTF of the day: %s", err)
+			fmt.Printf("wtf of the day: %s", err)
 			continue
 		}
 
@@ -208,4 +262,72 @@ func FindInterface(name string) (*Endpoint, error) {
 	}
 
 	return nil, ErrNoIfaces
+}
+
+func SetWiFiRegion(region string) error {
+	if core.HasBinary("iw") {
+		if out, err := core.Exec("iw", []string{"reg", "set", region}); err != nil {
+			return err
+		} else if out != "" {
+			return fmt.Errorf("unexpected output while setting WiFi region %s: %s", region, out)
+		}
+	}
+	return nil
+}
+
+func ActivateInterface(name string) error {
+	if out, err := core.Exec("ifconfig", []string{name, "up"}); err != nil {
+		return err
+	} else if out != "" {
+		return fmt.Errorf("unexpected output while activating interface %s: %s", name, out)
+	}
+	return nil
+}
+
+func SetInterfaceTxPower(name string, txpower int) error {
+	if core.HasBinary("iw") {
+		Debug("SetInterfaceTxPower(%s, %d) iw based", name, txpower)
+		if _, err := core.Exec("iw", []string{"dev", name, "set", "txpower", "fixed", fmt.Sprintf("%d",
+			txpower)}); err != nil {
+			return err
+		}
+	} else if core.HasBinary("iwconfig") {
+		Debug("SetInterfaceTxPower(%s, %d) iwconfig based", name, txpower)
+		if out, err := core.Exec("iwconfig", []string{name, "txpower", fmt.Sprintf("%d", txpower)}); err != nil {
+			return err
+		} else if out != "" {
+			return fmt.Errorf("unexpected output while setting txpower to %d for interface %s: %s", txpower, name, out)
+		}
+	}
+	return nil
+}
+
+func GatewayProvidedByUser(iface *Endpoint, gateway string) (*Endpoint, error) {
+	Debug("GatewayProvidedByUser(%s) [cmd=%v opts=%v parser=%v]", gateway, IPv4RouteCmd, IPv4RouteCmdOpts, IPv4RouteParser)
+	if IPv4Validator.MatchString(gateway) {
+		Debug("valid gateway ip %s", gateway)
+		// we have the address, now we need its mac
+		if mac, err := ArpLookup(iface.Name(), gateway, false); err != nil {
+			return nil, err
+		} else {
+			Debug("gateway is %s[%s]", gateway, mac)
+			return NewEndpoint(gateway, mac), nil
+		}
+	}
+	return nil, fmt.Errorf("Provided gateway %s not a valid IPv4 address! Revert to find default gateway.", gateway)
+}
+
+func ColorRSSI(n int) string {
+	// ref. https://www.metageek.com/training/resources/understanding-rssi-2.html
+	rssi := fmt.Sprintf("%d dBm", n)
+	if n >= -67 {
+		rssi = tui.Green(rssi)
+	} else if n >= -70 {
+		rssi = tui.Dim(tui.Green(rssi))
+	} else if n >= -80 {
+		rssi = tui.Yellow(rssi)
+	} else {
+		rssi = tui.Dim(tui.Red(rssi))
+	}
+	return rssi
 }

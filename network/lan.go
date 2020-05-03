@@ -2,14 +2,14 @@ package network
 
 import (
 	"encoding/json"
-	"fmt"
 	"net"
 	"strings"
 	"sync"
+
+	"github.com/evilsocket/islazy/data"
 )
 
 const LANDefaultttl = 10
-const LANAliasesFile = "~/bettercap.aliases"
 
 type EndpointNewCallback func(e *Endpoint)
 type EndpointLostCallback func(e *Endpoint)
@@ -20,7 +20,7 @@ type LAN struct {
 	iface   *Endpoint
 	gateway *Endpoint
 	ttl     map[string]uint
-	aliases *Aliases
+	aliases *data.UnsortedKV
 	newCb   EndpointNewCallback
 	lostCb  EndpointLostCallback
 }
@@ -29,12 +29,7 @@ type lanJSON struct {
 	Hosts []*Endpoint `json:"hosts"`
 }
 
-func NewLAN(iface, gateway *Endpoint, newcb EndpointNewCallback, lostcb EndpointLostCallback) *LAN {
-	err, aliases := LoadAliases()
-	if err != nil {
-		fmt.Printf("%s\n", err)
-	}
-
+func NewLAN(iface, gateway *Endpoint, aliases *data.UnsortedKV, newcb EndpointNewCallback, lostcb EndpointLostCallback) *LAN {
 	return &LAN{
 		iface:   iface,
 		gateway: gateway,
@@ -58,27 +53,41 @@ func (l *LAN) MarshalJSON() ([]byte, error) {
 	return json.Marshal(doc)
 }
 
-func (lan *LAN) SetAliasFor(mac, alias string) bool {
+func (lan *LAN) Get(mac string) (*Endpoint, bool) {
 	lan.Lock()
 	defer lan.Unlock()
 
 	mac = NormalizeMac(mac)
-	if e, found := lan.hosts[mac]; found {
-		lan.aliases.Set(mac, alias)
-		e.Alias = alias
-		return true
-	}
-	return false
-}
 
-func (lan *LAN) Get(mac string) (*Endpoint, bool) {
-	lan.Lock()
-	defer lan.Unlock()
+	if mac == lan.iface.HwAddress {
+		return lan.iface, true
+	} else if mac == lan.gateway.HwAddress {
+		return lan.gateway, true
+	}
 
 	if e, found := lan.hosts[mac]; found {
 		return e, true
 	}
 	return nil, false
+}
+
+func (lan *LAN) GetByIp(ip string) *Endpoint {
+	lan.Lock()
+	defer lan.Unlock()
+
+	if ip == lan.iface.IpAddress {
+		return lan.iface
+	} else if ip == lan.gateway.IpAddress {
+		return lan.gateway
+	}
+
+	for _, e := range lan.hosts {
+		if e.IpAddress == ip {
+			return e
+		}
+	}
+
+	return nil
 }
 
 func (lan *LAN) List() (list []*Endpoint) {
@@ -92,7 +101,7 @@ func (lan *LAN) List() (list []*Endpoint) {
 	return
 }
 
-func (lan *LAN) Aliases() *Aliases {
+func (lan *LAN) Aliases() *data.UnsortedKV {
 	return lan.aliases
 }
 
@@ -169,19 +178,6 @@ func (lan *LAN) EachHost(cb func(mac string, e *Endpoint)) {
 	}
 }
 
-func (lan *LAN) GetByIp(ip string) *Endpoint {
-	lan.Lock()
-	defer lan.Unlock()
-
-	for _, e := range lan.hosts {
-		if e.IpAddress == ip {
-			return e
-		}
-	}
-
-	return nil
-}
-
 func (lan *LAN) AddIfNew(ip, mac string) *Endpoint {
 	lan.Lock()
 	defer lan.Unlock()
@@ -197,7 +193,7 @@ func (lan *LAN) AddIfNew(ip, mac string) *Endpoint {
 		return t
 	}
 
-	e := NewEndpointWithAlias(ip, mac, lan.aliases.Get(mac))
+	e := NewEndpointWithAlias(ip, mac, lan.aliases.GetOr(mac, ""))
 
 	lan.hosts[mac] = e
 	lan.ttl[mac] = LANDefaultttl
@@ -208,5 +204,12 @@ func (lan *LAN) AddIfNew(ip, mac string) *Endpoint {
 }
 
 func (lan *LAN) GetAlias(mac string) string {
-	return lan.aliases.Get(mac)
+	return lan.aliases.GetOr(mac, "")
+}
+
+func (lan *LAN) Clear() {
+	lan.Lock()
+	defer lan.Unlock()
+	lan.hosts = make(map[string]*Endpoint)
+	lan.ttl = make(map[string]uint)
 }

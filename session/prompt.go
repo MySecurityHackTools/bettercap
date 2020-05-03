@@ -4,35 +4,19 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bettercap/bettercap/core"
+	"github.com/evilsocket/islazy/tui"
 
 	"github.com/dustin/go-humanize"
 )
 
 const (
-	PromptVariable = "$"
-	DefaultPrompt  = "{by}{fw}{cidr} {fb}> {env.iface.ipv4} {reset} {bold}» {reset}"
+	PromptVariable       = "$"
+	DefaultPrompt        = "{by}{fw}{cidr} {fb}> {env.iface.ipv4} {reset} {bold}» {reset}"
+	DefaultPromptMonitor = "{by}{fb} {env.iface.name} {reset} {bold}» {reset}"
 )
 
 var (
-	// these are here because if colors are disabled,
-	// we need the updated core.* variables
-	effects = map[string]string{
-		"{bold}":  core.BOLD,
-		"{dim}":   core.DIM,
-		"{r}":     core.RED,
-		"{g}":     core.GREEN,
-		"{b}":     core.BLUE,
-		"{y}":     core.YELLOW,
-		"{fb}":    core.FG_BLACK,
-		"{fw}":    core.FG_WHITE,
-		"{bdg}":   core.BG_DGRAY,
-		"{br}":    core.BG_RED,
-		"{bg}":    core.BG_GREEN,
-		"{by}":    core.BG_YELLOW,
-		"{blb}":   core.BG_LBLUE, // Ziggy this is for you <3
-		"{reset}": core.RESET,
-	}
+	effects         = map[string]string{}
 	PromptCallbacks = map[string]func(s *Session) string{
 		"{cidr}": func(s *Session) string {
 			return s.Interface.CIDR()
@@ -62,6 +46,24 @@ type Prompt struct {
 }
 
 func NewPrompt() Prompt {
+	// these are here because if colors are disabled,
+	// we need the updated tui.* variables
+	effects = map[string]string{
+		"{bold}":  tui.BOLD,
+		"{dim}":   tui.DIM,
+		"{r}":     tui.RED,
+		"{g}":     tui.GREEN,
+		"{b}":     tui.BLUE,
+		"{y}":     tui.YELLOW,
+		"{fb}":    tui.FOREBLACK,
+		"{fw}":    tui.FOREWHITE,
+		"{bdg}":   tui.BACKDARKGRAY,
+		"{br}":    tui.BACKRED,
+		"{bg}":    tui.BACKGREEN,
+		"{by}":    tui.BACKYELLOW,
+		"{blb}":   tui.BACKLIGHTBLUE, // Ziggy this is for you <3
+		"{reset}": tui.RESET,
+	}
 	return Prompt{}
 }
 
@@ -80,8 +82,8 @@ func (p Prompt) Render(s *Session) string {
 	}
 
 	// make sure an user error does not screw all terminal
-	if !strings.HasPrefix(prompt, core.RESET) {
-		prompt += core.RESET
+	if !strings.HasPrefix(prompt, tui.RESET) {
+		prompt += tui.RESET
 	}
 
 	return prompt

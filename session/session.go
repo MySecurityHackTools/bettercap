@@ -1,154 +1,120 @@
 package session
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"net"
 	"os"
-	"os/signal"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/bettercap/readline"
 
+	"github.com/bettercap/bettercap/caplets"
 	"github.com/bettercap/bettercap/core"
 	"github.com/bettercap/bettercap/firewall"
 	"github.com/bettercap/bettercap/network"
 	"github.com/bettercap/bettercap/packets"
 
-	"github.com/adrianmo/go-nmea"
+	"github.com/evilsocket/islazy/data"
+	"github.com/evilsocket/islazy/fs"
+	"github.com/evilsocket/islazy/log"
+	"github.com/evilsocket/islazy/ops"
+	"github.com/evilsocket/islazy/str"
+	"github.com/evilsocket/islazy/tui"
 )
 
-const HistoryFile = "~/bettercap.history"
+const (
+	HistoryFile = "~/bettercap.history"
+)
 
 var (
 	I = (*Session)(nil)
 
-	ErrAlreadyStarted = errors.New("Module is already running.")
-	ErrAlreadyStopped = errors.New("Module is not running.")
-	ErrNotSupported   = errors.New("This component is not supported on this OS.")
+	ErrNotSupported = errors.New("this component is not supported on this OS")
 
 	reCmdSpaceCleaner = regexp.MustCompile(`^([^\s]+)\s+(.+)$`)
 	reEnvVarCapture   = regexp.MustCompile(`{env\.([^}]+)}`)
 )
 
-type UnknownCommandCallback func(cmd string) bool
-
-type Session struct {
-	Options   core.Options             `json:"options"`
-	Interface *network.Endpoint        `json:"interface"`
-	Gateway   *network.Endpoint        `json:"gateway"`
-	Firewall  firewall.FirewallManager `json:"-"`
-	Env       *Environment             `json:"env"`
-	Lan       *network.LAN             `json:"lan"`
-	WiFi      *network.WiFi            `json:"wifi"`
-	BLE       *network.BLE             `json:"ble"`
-	Queue     *packets.Queue           `json:"packets"`
-	Input     *readline.Instance       `json:"-"`
-	StartedAt time.Time                `json:"started_at"`
-	Active    bool                     `json:"active"`
-	GPS       nmea.GNGGA               `json:"gps"`
-	Prompt    Prompt                   `json:"-"`
-
-	CoreHandlers []CommandHandler `json:"-"`
-	Modules      []Module         `json:"-"`
-
-	Events *EventPool `json:"-"`
-
-	UnkCmdCallback UnknownCommandCallback `json:"-"`
+func ErrAlreadyStarted(name string) error {
+	return fmt.Errorf("module %s is already running", name)
 }
 
-func ParseCommands(line string) []string {
-	args := []string{}
-	buf := ""
+func ErrAlreadyStopped(name string) error {
+	return fmt.Errorf("module %s is not running", name)
+}
 
-	singleQuoted := false
-	doubleQuoted := false
-	finish := false
+type UnknownCommandCallback func(cmd string) bool
 
-	for _, c := range line {
-		switch c {
-		case ';':
-			if !singleQuoted && !doubleQuoted {
-				finish = true
-			} else {
-				buf += string(c)
-			}
+type GPS struct {
+	Updated       time.Time
+	Latitude      float64 // Latitude.
+	Longitude     float64 // Longitude.
+	FixQuality    string  // Quality of fix.
+	NumSatellites int64   // Number of satellites in use.
+	HDOP          float64 // Horizontal dilution of precision.
+	Altitude      float64 // Altitude.
+	Separation    float64 // Geoidal separation
+}
 
-		case '"':
-			if doubleQuoted {
-				// finish of quote
-				doubleQuoted = false
-			} else if singleQuoted {
-				// quote initiated with ', so we ignore it
-				buf += string(c)
-			} else {
-				// quote init here
-				doubleQuoted = true
-			}
+const AliasesFile = "~/bettercap.aliases"
 
-		case '\'':
-			if singleQuoted {
-				singleQuoted = false
-			} else if doubleQuoted {
-				buf += string(c)
-			} else {
-				singleQuoted = true
-			}
+var aliasesFileName, _ = fs.Expand(AliasesFile)
 
-		default:
-			buf += string(c)
-		}
+type Session struct {
+	Options   core.Options
+	Interface *network.Endpoint
+	Gateway   *network.Endpoint
+	Env       *Environment
+	Lan       *network.LAN
+	WiFi      *network.WiFi
+	BLE       *network.BLE
+	HID       *network.HID
+	Queue     *packets.Queue
+	StartedAt time.Time
+	Active    bool
+	GPS       GPS
+	Modules   ModuleList
+	Aliases   *data.UnsortedKV
 
-		if finish {
-			args = append(args, buf)
-			finish = false
-			buf = ""
-		}
-	}
-
-	if len(buf) > 0 {
-		args = append(args, buf)
-	}
-
-	cmds := make([]string, 0)
-	for _, cmd := range args {
-		cmd = core.Trim(cmd)
-		if cmd != "" || (len(cmd) > 0 && cmd[0] != '#') {
-			cmds = append(cmds, cmd)
-		}
-	}
-
-	return cmds
+	Input            *readline.Instance
+	Prompt           Prompt
+	CoreHandlers     []CommandHandler
+	Events           *EventPool
+	EventsIgnoreList *EventsIgnoreList
+	UnkCmdCallback   UnknownCommandCallback
+	Firewall         firewall.FirewallManager
 }
 
 func New() (*Session, error) {
-	var err error
-
-	s := &Session{
-		Prompt: NewPrompt(),
-		Env:    nil,
-		Active: false,
-		Queue:  nil,
-
-		CoreHandlers:   make([]CommandHandler, 0),
-		Modules:        make([]Module, 0),
-		Events:         nil,
-		UnkCmdCallback: nil,
-	}
-
-	if s.Options, err = core.ParseOptions(); err != nil {
+	opts, err := core.ParseOptions()
+	if err != nil {
 		return nil, err
 	}
 
-	core.InitSwag(*s.Options.NoColors)
+	if *opts.NoColors || !tui.Effects() {
+		tui.Disable()
+		log.NoEffects = true
+	}
+
+	s := &Session{
+		Prompt:  NewPrompt(),
+		Options: opts,
+		Env:     nil,
+		Active:  false,
+		Queue:   nil,
+
+		CoreHandlers:     make([]CommandHandler, 0),
+		Modules:          make([]Module, 0),
+		Events:           nil,
+		EventsIgnoreList: NewEventsIgnoreList(),
+		UnkCmdCallback:   nil,
+	}
 
 	if *s.Options.CpuProfile != "" {
 		if f, err := os.Create(*s.Options.CpuProfile); err != nil {
@@ -159,6 +125,10 @@ func New() (*Session, error) {
 	}
 
 	if s.Env, err = NewEnvironment(*s.Options.EnvFile); err != nil {
+		return nil, err
+	}
+
+	if s.Aliases, err = data.NewUnsortedKV(aliasesFileName, data.FlushOnEdit); err != nil {
 		return nil, err
 	}
 
@@ -173,76 +143,34 @@ func New() (*Session, error) {
 	return s, nil
 }
 
+func (s *Session) Lock() {
+	s.Env.Lock()
+	s.Lan.Lock()
+	s.WiFi.Lock()
+}
+
+func (s *Session) Unlock() {
+	s.Env.Unlock()
+	s.Lan.Unlock()
+	s.WiFi.Unlock()
+}
+
 func (s *Session) Module(name string) (err error, mod Module) {
 	for _, m := range s.Modules {
 		if m.Name() == name {
 			return nil, m
 		}
 	}
-	return fmt.Errorf("Module %s not found", name), mod
-}
-
-func (s *Session) setupReadline() error {
-	var err error
-
-	pcompleters := make([]readline.PrefixCompleterInterface, 0)
-	for _, h := range s.CoreHandlers {
-		if h.Completer == nil {
-			pcompleters = append(pcompleters, readline.PcItem(h.Name))
-		} else {
-			pcompleters = append(pcompleters, h.Completer)
-		}
-	}
-
-	tree := make(map[string][]string)
-	for _, m := range s.Modules {
-		for _, h := range m.Handlers() {
-			parts := strings.Split(h.Name, " ")
-			name := parts[0]
-
-			if _, found := tree[name]; !found {
-				tree[name] = []string{}
-			}
-
-			var appendedOption = strings.Join(parts[1:], " ")
-
-			if len(appendedOption) > 0 {
-				tree[name] = append(tree[name], appendedOption)
-			}
-		}
-	}
-
-	for root, subElems := range tree {
-		item := readline.PcItem(root)
-		item.Children = []readline.PrefixCompleterInterface{}
-
-		for _, child := range subElems {
-			item.Children = append(item.Children, readline.PcItem(child))
-		}
-
-		pcompleters = append(pcompleters, item)
-	}
-
-	history := ""
-	if !*s.Options.NoHistory {
-		history, _ = core.ExpandPath(HistoryFile)
-	}
-
-	cfg := readline.Config{
-		HistoryFile:     history,
-		InterruptPrompt: "^C",
-		EOFPrompt:       "exit",
-		AutoComplete:    readline.NewPrefixCompleter(pcompleters...),
-	}
-
-	s.Input, err = readline.NewEx(&cfg)
-	return err
+	return fmt.Errorf("module %s not found", name), mod
 }
 
 func (s *Session) Close() {
-	fmt.Printf("\nStopping modules and cleaning session state ...\n")
+	if *s.Options.PrintVersion {
+		return
+	}
 
 	if *s.Options.Debug {
+		fmt.Printf("\nStopping modules and cleaning session state ...\n")
 		s.Events.Add("session.closing", nil)
 	}
 
@@ -255,9 +183,9 @@ func (s *Session) Close() {
 	s.Firewall.Restore()
 
 	if *s.Options.EnvFile != "" {
-		envFile, _ := core.ExpandPath(*s.Options.EnvFile)
+		envFile, _ := fs.Expand(*s.Options.EnvFile)
 		if err := s.Env.Save(envFile); err != nil {
-			fmt.Printf("Error while storing the environment to %s: %s", envFile, err)
+			fmt.Printf("error while storing the environment to %s: %s", envFile, err)
 		}
 	}
 
@@ -268,13 +196,13 @@ func (s *Session) Close() {
 	if *s.Options.MemProfile != "" {
 		f, err := os.Create(*s.Options.MemProfile)
 		if err != nil {
-			fmt.Printf("Could not create memory profile: %s\n", err)
+			fmt.Printf("could not create memory profile: %s\n", err)
 			return
 		}
 		defer f.Close()
 		runtime.GC() // get up-to-date statistics
 		if err := pprof.WriteHeapProfile(f); err != nil {
-			fmt.Printf("Could not write memory profile: %s\n", err)
+			fmt.Printf("could not write memory profile: %s\n", err)
 		}
 	}
 }
@@ -284,80 +212,12 @@ func (s *Session) Register(mod Module) error {
 	return nil
 }
 
-func (s *Session) startNetMon() {
-	// keep reading network events in order to add / update endpoints
-	go func() {
-		for event := range s.Queue.Activities {
-			if !s.Active {
-				return
-			}
-
-			if s.IsOn("net.recon") && event.Source {
-				addr := event.IP.String()
-				mac := event.MAC.String()
-
-				existing := s.Lan.AddIfNew(addr, mac)
-				if existing != nil {
-					existing.LastSeen = time.Now()
-				}
-			}
-		}
-	}()
-}
-
-func (s *Session) setupSignals() {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	signal.Notify(c, syscall.SIGTERM)
-	go func() {
-		<-c
-		fmt.Println()
-		s.Events.Log(core.WARNING, "Got SIGTERM")
-		s.Close()
-		os.Exit(0)
-	}()
-}
-
-func (s *Session) setupEnv() {
-	s.Env.Set("iface.index", fmt.Sprintf("%d", s.Interface.Index))
-	s.Env.Set("iface.name", s.Interface.Name())
-	s.Env.Set("iface.ipv4", s.Interface.IpAddress)
-	s.Env.Set("iface.ipv6", s.Interface.Ip6Address)
-	s.Env.Set("iface.mac", s.Interface.HwAddress)
-	s.Env.Set("gateway.address", s.Gateway.IpAddress)
-	s.Env.Set("gateway.mac", s.Gateway.HwAddress)
-
-	if found, v := s.Env.Get(PromptVariable); !found || v == "" {
-		s.Env.Set(PromptVariable, DefaultPrompt)
-	}
-
-	dbg := "false"
-	if *s.Options.Debug {
-		dbg = "true"
-	}
-	s.Env.WithCallback("log.debug", dbg, func(newValue string) {
-		newDbg := false
-		if newValue == "true" {
-			newDbg = true
-		}
-		s.Events.SetDebug(newDbg)
-	})
-
-	silent := "false"
-	if *s.Options.Silent {
-		silent = "true"
-	}
-	s.Env.WithCallback("log.silent", silent, func(newValue string) {
-		newSilent := false
-		if newValue == "true" {
-			newSilent = true
-		}
-		s.Events.SetSilent(newSilent)
-	})
-}
-
 func (s *Session) Start() error {
 	var err error
+
+	network.Debug = func(format string, args ...interface{}) {
+		s.Events.Log(log.DEBUG, format, args...)
+	}
 
 	// make sure modules are always sorted by name
 	sort.Slice(s.Modules, func(i, j int) bool {
@@ -372,8 +232,18 @@ func (s *Session) Start() error {
 		return err
 	}
 
-	if s.Gateway, err = network.FindGateway(s.Interface); err != nil {
-		s.Events.Log(core.WARNING, "%s", err.Error())
+	if *s.Options.Gateway != "" {
+		if s.Gateway, err = network.GatewayProvidedByUser(s.Interface, *s.Options.Gateway); err != nil {
+			s.Events.Log(log.WARNING, "%s", err.Error())
+			s.Gateway, err = network.FindGateway(s.Interface)
+		}
+	} else {
+		s.Gateway, err = network.FindGateway(s.Interface)
+	}
+
+	if err != nil {
+		level := ops.Ternary(s.Interface.IsMonitor(), log.DEBUG, log.WARNING).(log.Verbosity)
+		s.Events.Log(level, "%s", err.Error())
 	}
 
 	if s.Gateway == nil || s.Gateway.IpAddress == s.Interface.IpAddress {
@@ -382,19 +252,25 @@ func (s *Session) Start() error {
 
 	s.Firewall = firewall.Make(s.Interface)
 
-	s.BLE = network.NewBLE(func(dev *network.BLEDevice) {
+	s.HID = network.NewHID(s.Aliases, func(dev *network.HIDDevice) {
+		s.Events.Add("hid.device.new", dev)
+	}, func(dev *network.HIDDevice) {
+		s.Events.Add("hid.device.lost", dev)
+	})
+
+	s.BLE = network.NewBLE(s.Aliases, func(dev *network.BLEDevice) {
 		s.Events.Add("ble.device.new", dev)
 	}, func(dev *network.BLEDevice) {
 		s.Events.Add("ble.device.lost", dev)
 	})
 
-	s.WiFi = network.NewWiFi(s.Interface, func(ap *network.AccessPoint) {
+	s.WiFi = network.NewWiFi(s.Interface, s.Aliases, func(ap *network.AccessPoint) {
 		s.Events.Add("wifi.ap.new", ap)
 	}, func(ap *network.AccessPoint) {
 		s.Events.Add("wifi.ap.lost", ap)
 	})
 
-	s.Lan = network.NewLAN(s.Interface, s.Gateway, func(e *network.Endpoint) {
+	s.Lan = network.NewLAN(s.Interface, s.Gateway, s.Aliases, func(e *network.Endpoint) {
 		s.Events.Add("endpoint.new", e)
 	}, func(e *network.Endpoint) {
 		s.Events.Add("endpoint.lost", e)
@@ -431,6 +307,39 @@ func (s *Session) Skip(ip net.IP) bool {
 	return false
 }
 
+func (s *Session) FindMAC(ip net.IP, probe bool) (net.HardwareAddr, error) {
+	var mac string
+	var hw net.HardwareAddr
+	var err error
+
+	// do we have this ip mac address?
+	mac, err = network.ArpLookup(s.Interface.Name(), ip.String(), false)
+	if err != nil && probe {
+		from := s.Interface.IP
+		from_hw := s.Interface.HW
+
+		if err, probe := packets.NewUDPProbe(from, from_hw, ip, 139); err != nil {
+			log.Error("Error while creating UDP probe packet for %s: %s", ip.String(), err)
+		} else {
+			s.Queue.Send(probe)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+		mac, _ = network.ArpLookup(s.Interface.Name(), ip.String(), false)
+	}
+
+	if mac == "" {
+		return nil, fmt.Errorf("Could not find hardware address for %s.", ip.String())
+	}
+
+	mac = network.NormalizeMac(mac)
+	hw, err = net.ParseMAC(mac)
+	if err != nil {
+		return nil, fmt.Errorf("Error while parsing hardware address '%s' for %s: %s", mac, ip.String(), err)
+	}
+	return hw, nil
+}
+
 func (s *Session) IsOn(moduleName string) bool {
 	for _, m := range s.Modules {
 		if m.Name() == moduleName {
@@ -438,19 +347,6 @@ func (s *Session) IsOn(moduleName string) bool {
 		}
 	}
 	return false
-}
-
-func (s *Session) parseEnvTokens(str string) (string, error) {
-	// replace all {env.something} with their values
-	for _, m := range reEnvVarCapture.FindAllString(str, -1) {
-		varName := strings.Trim(strings.Replace(m, "env.", "", -1), "{}")
-		if found, value := s.Env.Get(varName); found {
-			str = strings.Replace(str, m, value, -1)
-		} else {
-			return "", fmt.Errorf("variable '%s' is not defined", varName)
-		}
-	}
-	return str, nil
 }
 
 func (s *Session) Refresh() {
@@ -465,97 +361,42 @@ func (s *Session) ReadLine() (string, error) {
 }
 
 func (s *Session) RunCaplet(filename string) error {
-	s.Events.Log(core.INFO, "Reading from caplet %s ...", filename)
-
-	input, err := os.Open(filename)
+	caplet, err := caplets.Load(filename)
 	if err != nil {
 		return err
 	}
-	defer input.Close()
 
-	scanner := bufio.NewScanner(input)
-	scanner.Split(bufio.ScanLines)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || line[0] == '#' {
-			continue
-		}
-
-		if err = s.Run(line); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return caplet.Eval(nil, func(line string) error {
+		return s.Run(line + "\n")
+	})
 }
 
-func (s *Session) isCapletCommand(line string) (is bool, filename string, argv []string) {
-	paths := []string{
-		"./",
-		"./caplets/",
-	}
-
-	capspath := core.Trim(os.Getenv("CAPSPATH"))
-	paths = append(paths, core.SepSplit(capspath, ":")...)
-	file := core.Trim(line)
+func parseCapletCommand(line string) (is bool, caplet *caplets.Caplet, argv []string) {
+	file := str.Trim(line)
 	parts := strings.Split(file, " ")
 	argc := len(parts)
 	argv = make([]string, 0)
 	// check for any arguments
 	if argc > 1 {
-		file = core.Trim(parts[0])
-		if argc >= 2 {
-			argv = parts[1:]
-		}
+		file = str.Trim(parts[0])
+		argv = parts[1:]
 	}
 
-	for _, path := range paths {
-		filename := filepath.Join(path, file) + ".cap"
-		if core.Exists(filename) {
-			return true, filename, argv
-		}
+	if cap, err := caplets.Load(file); err == nil {
+		return true, cap, argv
 	}
 
-	return false, "", nil
-}
-
-func (s *Session) runCapletCommand(filename string, argv []string) error {
-	input, err := os.Open(filename)
-	if err != nil {
-		return err
-	}
-	defer input.Close()
-
-	scanner := bufio.NewScanner(input)
-	scanner.Split(bufio.ScanLines)
-
-	for scanner.Scan() {
-		line := scanner.Text()
-		if line == "" || line[0] == '#' {
-			continue
-		}
-
-		// replace $0 with argv[0], $1 with argv[1] and so on
-		for i, arg := range argv {
-			line = strings.Replace(line, fmt.Sprintf("$%d", i), arg, -1)
-		}
-
-		if err = s.Run(line); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return false, nil, nil
 }
 
 func (s *Session) Run(line string) error {
-	line = core.TrimRight(line)
+	line = str.TrimRight(line)
 	// remove extra spaces after the first command
 	// so that 'arp.spoof      on' is normalized
 	// to 'arp.spoof on' (fixes #178)
 	line = reCmdSpaceCleaner.ReplaceAllString(line, "$1 $2")
 
+	// replace all {env.something} with their values
 	line, err := s.parseEnvTokens(line)
 	if err != nil {
 		return err
@@ -578,8 +419,10 @@ func (s *Session) Run(line string) error {
 	}
 
 	// is it a caplet command?
-	if is, filename, argv := s.isCapletCommand(line); is {
-		return s.runCapletCommand(filename, argv)
+	if parsed, caplet, argv := parseCapletCommand(line); parsed {
+		return caplet.Eval(argv, func(line string) error {
+			return s.Run(line + "\n")
+		})
 	}
 
 	// is it a proxy module custom command?
@@ -587,5 +430,5 @@ func (s *Session) Run(line string) error {
 		return nil
 	}
 
-	return fmt.Errorf("Unknown or invalid syntax \"%s%s%s\", type %shelp%s for the help menu.", core.BOLD, line, core.RESET, core.BOLD, core.RESET)
+	return fmt.Errorf("unknown or invalid syntax \"%s%s%s\", type %shelp%s for the help menu.", tui.BOLD, line, tui.RESET, tui.BOLD, tui.RESET)
 }

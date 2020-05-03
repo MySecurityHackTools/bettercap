@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/bettercap/bettercap/core"
+	"github.com/evilsocket/islazy/fs"
 )
 
 type EnvironmentChangedCallback func(newValue string)
@@ -26,8 +26,8 @@ func NewEnvironment(envFile string) (*Environment, error) {
 	}
 
 	if envFile != "" {
-		envFile, _ := core.ExpandPath(envFile)
-		if core.Exists(envFile) {
+		envFile, _ := fs.Expand(envFile)
+		if fs.Exists(envFile) {
 			if err := env.Load(envFile); err != nil {
 				return nil, err
 			}
@@ -87,10 +87,11 @@ func (env *Environment) WithCallback(name, value string, cb EnvironmentChangedCa
 
 func (env *Environment) Set(name, value string) string {
 	env.Lock()
-	defer env.Unlock()
 
 	old := env.Data[name]
 	env.Data[name] = value
+
+	env.Unlock()
 
 	if cb, hasCallback := env.cbs[name]; hasCallback {
 		cb(value)
@@ -99,15 +100,17 @@ func (env *Environment) Set(name, value string) string {
 	return old
 }
 
-func (env *Environment) Get(name string) (bool, string) {
-	env.Lock()
-	defer env.Unlock()
-
+func (env *Environment) GetUnlocked(name string) (bool, string) {
 	if value, found := env.Data[name]; found {
 		return true, value
 	}
-
 	return false, ""
+}
+
+func (env *Environment) Get(name string) (bool, string) {
+	env.Lock()
+	defer env.Unlock()
+	return env.GetUnlocked(name)
 }
 
 func (env *Environment) GetInt(name string) (error, int) {

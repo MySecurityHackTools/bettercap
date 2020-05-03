@@ -1,20 +1,31 @@
 package session
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
 	"strconv"
+	"sync"
 
-	"github.com/bettercap/bettercap/core"
+	"github.com/evilsocket/islazy/str"
+	"github.com/evilsocket/islazy/tui"
+
+	"github.com/bettercap/readline"
 )
 
-const IPv4Validator = `^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$`
+const (
+	IPv4Validator = `^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$`
+	IPv6Validator = `^[:a-fA-F0-9]{6,}$`
+)
 
 type ModuleHandler struct {
+	sync.Mutex
+
 	Name        string
 	Description string
 	Parser      *regexp.Regexp
-	Exec        func(args []string) error
+	Completer   *readline.PrefixCompleter
+	exec        func(args []string) error
 }
 
 func NewModuleHandler(name string, expr string, desc string, exec func(args []string) error) ModuleHandler {
@@ -22,7 +33,7 @@ func NewModuleHandler(name string, expr string, desc string, exec func(args []st
 		Name:        name,
 		Description: desc,
 		Parser:      nil,
-		Exec:        exec,
+		exec:        exec,
 	}
 
 	if expr != "" {
@@ -32,8 +43,15 @@ func NewModuleHandler(name string, expr string, desc string, exec func(args []st
 	return h
 }
 
+func (h *ModuleHandler) Complete(name string, cb func(prefix string) []string) {
+	h.Completer = readline.PcItem(name, readline.PcItemDynamic(func(prefix string) []string {
+		prefix = str.Trim(prefix[len(name):])
+		return cb(prefix)
+	}))
+}
+
 func (h *ModuleHandler) Help(padding int) string {
-	return fmt.Sprintf("  "+core.Bold("%"+strconv.Itoa(padding)+"s")+" : %s\n", h.Name, h.Description)
+	return fmt.Sprintf("  "+tui.Bold("%"+strconv.Itoa(padding)+"s")+" : %s\n", h.Name, h.Description)
 }
 
 func (h *ModuleHandler) Parse(line string) (bool, []string) {
@@ -48,4 +66,27 @@ func (h *ModuleHandler) Parse(line string) (bool, []string) {
 		return true, result[1:]
 	}
 	return false, nil
+}
+
+func (h *ModuleHandler) Exec(args []string) error {
+	h.Lock()
+	defer h.Unlock()
+	return h.exec(args)
+}
+
+type JSONModuleHandler struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Parser      string `json:"parser"`
+}
+
+func (h ModuleHandler) MarshalJSON() ([]byte, error) {
+	j := JSONModuleHandler{
+		Name:        h.Name,
+		Description: h.Description,
+	}
+	if h.Parser != nil {
+		j.Parser = h.Parser.String()
+	}
+	return json.Marshal(j)
 }

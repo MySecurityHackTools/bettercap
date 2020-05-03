@@ -7,7 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bettercap/bettercap/core"
+	"github.com/evilsocket/islazy/log"
+	"github.com/evilsocket/islazy/tui"
 )
 
 type Event struct {
@@ -17,7 +18,7 @@ type Event struct {
 }
 
 type LogMessage struct {
-	Level   int
+	Level   log.Verbosity
 	Message string
 }
 
@@ -30,10 +31,10 @@ func NewEvent(tag string, data interface{}) Event {
 }
 
 func (e Event) Label() string {
-	log := e.Data.(LogMessage)
-	label := core.LogLabels[log.Level]
-	color := core.LogColors[log.Level]
-	return color + label + core.RESET
+	m := e.Data.(LogMessage)
+	label := log.LevelName(m.Level)
+	color := log.LevelColor(m.Level)
+	return color + label + tui.RESET
 }
 
 type EventPool struct {
@@ -58,6 +59,18 @@ func (p *EventPool) Listen() <-chan Event {
 	p.Lock()
 	defer p.Unlock()
 	l := make(chan Event)
+
+	// make sure, without blocking, the new listener
+	// will receive all the queued events
+	go func() {
+		for i := len(p.events) - 1; i >= 0; i-- {
+			defer func() {
+				recover()
+			}()
+			l <- p.events[i]
+		}
+	}()
+
 	p.listeners = append(p.listeners, l)
 	return l
 }
@@ -96,14 +109,23 @@ func (p *EventPool) Add(tag string, data interface{}) {
 
 	// broadcast the event to every listener
 	for _, l := range p.listeners {
-		l <- e
+		// do not block!
+		go func(ch chan Event) {
+			// channel might be closed
+			defer func() {
+				if recover() != nil {
+
+				}
+			}()
+			ch <- e
+		}(l)
 	}
 }
 
-func (p *EventPool) Log(level int, format string, args ...interface{}) {
-	if level == core.DEBUG && !p.debug {
+func (p *EventPool) Log(level log.Verbosity, format string, args ...interface{}) {
+	if level == log.DEBUG && !p.debug {
 		return
-	} else if level < core.ERROR && p.silent {
+	} else if level < log.ERROR && p.silent {
 		return
 	}
 
@@ -114,7 +136,7 @@ func (p *EventPool) Log(level int, format string, args ...interface{}) {
 		message,
 	})
 
-	if level == core.FATAL {
+	if level == log.FATAL {
 		fmt.Fprintf(os.Stderr, "%s\n", message)
 		os.Exit(1)
 	}
